@@ -4,9 +4,14 @@
 # This repo holds ONLY the feed. No app code here.
 #
 # Files in this repo:
-#   backend/pull.mjs, backend/cache.json, backend/apple-valley.json,
-#   backend/seed-static.json
+#   backend/pull.mjs, backend/pull-apple-valley.mjs, backend/cache.json,
+#   backend/apple-valley.json, backend/seed-static.json
 #   animals.json (at the repo root — this is what GitHub Pages serves)
+#
+# Apple Valley: backend/pull-apple-valley.mjs runs FIRST (public
+# Adopt-a-Pet listings, no API key — see backend/APPLE-VALLEY-PULL.md).
+# If it fails, the last good apple-valley.json is kept and the feed pull
+# below still runs with it.
 #
 # SETUP (one time, about 5 minutes, no cost):
 #  1. Create repo LApets-feed, Public, empty (no README).
@@ -41,12 +46,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Pull Apple Valley animals (public Adopt-a-Pet listings)
+        run: node backend/pull-apple-valley.mjs || echo "Apple Valley pull failed — keeping last good apple-valley.json"
       - name: Pull fresh animals
         run: node backend/pull.mjs --out=animals.json
       - name: Commit the new feed (only if it changed)
         run: |
           git config user.name "LApets feed bot"
           git config user.email "feed@lapets.app"
-          git add animals.json backend/cache.json
+          git add animals.json backend/cache.json backend/apple-valley.json
           git diff --cached --quiet || git commit -m "Daily animal feed: $(date -u +%Y-%m-%d)"
           git push
