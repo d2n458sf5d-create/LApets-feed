@@ -42,7 +42,7 @@ jobs:
         with:
           node-version: "22"
       - name: Pull fresh animals
-        run: node backend/pull.mjs --out animals.json
+        run: node backend/pull.mjs --out=animals.json
       - name: Commit the new feed (only if it changed)
         run: |
           git config user.name "LApets feed bot"
