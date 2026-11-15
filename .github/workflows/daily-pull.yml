@@ -1,0 +1,52 @@
+# LApets v1.1 — daily live-feed pull (GitHub Actions).
+#
+# Repo: LApets-feed (PUBLIC, separate from the private LApets-ios app repo)
+# This repo holds ONLY the feed. No app code here.
+#
+# Files in this repo:
+#   backend/pull.mjs, backend/cache.json, backend/apple-valley.json,
+#   backend/seed-static.json
+#   animals.json (at the repo root — this is what GitHub Pages serves)
+#
+# SETUP (one time, about 5 minutes, no cost):
+#  1. Create repo LApets-feed, Public, empty (no README).
+#  2. Upload backend/ folder with pull.mjs, cache.json, apple-valley.json,
+#     seed-static.json.
+#  3. Upload this file to .github/workflows/daily-pull.yml.
+#  4. Upload animals.json to the repo root.
+#  5. Repo Settings > Pages > Source "Deploy from a branch", Branch main,
+#     Folder / (root). Save.
+#     The feed will then be live at:
+#       https://d2n458sf5d-create.github.io/LApets-feed/animals.json
+#  6. Actions tab > "LApets daily live feed" > Run workflow, to test it once.
+#     Check the run log: it should end with "FEED WRITTEN".
+#
+# If a run fails, the workflow does NOT commit anything — the previous
+# animals.json stays live, and the app falls back to it.
+name: LApets daily live feed
+
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Pull fresh animals
+        run: node backend/pull.mjs --out animals.json
+      - name: Commit the new feed (only if it changed)
+        run: |
+          git config user.name "LApets feed bot"
+          git config user.email "feed@lapets.app"
+          git add animals.json backend/cache.json
+          git diff --cached --quiet || git commit -m "Daily animal feed: $(date -u +%Y-%m-%d)"
+          git push
