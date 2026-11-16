@@ -1,276 +1,332 @@
-// LApets — daily Apple Valley pull.
-// Node 22, no dependencies. Run: node backend/pull-apple-valley.mjs [--out backend/apple-valley.json]
+// LApets v1.1 — daily animal feed puller.
+// Node 22, no dependencies. Run: node backend/pull.mjs [--out data/animals.json]
 //
-// What it does:
-//  1. Fetches the PUBLIC Adopt-a-Pet shelter page for Apple Valley Animal
-//     Services (shelter 82156), paginated, 12 pets per page, with a browser
-//     user-agent. No API key, no login, no credential of any kind, and the
-//     shelter is never asked for anything: the shelter does not send us a
-//     list or a feed, we read the same public listings anyone can open.
-//  2. For each pet it keeps the record already in apple-valley.json
-//     (intake date, exact age, size and weight stay exactly as they were
-//     pulled on Nov 11, 2026 — an intake date never changes).
-//  3. For a genuinely new pet it fetches that pet's public Adopt-a-Pet
-//     detail page once and takes only what the shelter publishes there:
-//     species, breed, sex, age group, color, size, weight, Pet ID, and the
-//     main photo (og:image). The intake date is set to null — NEVER guessed
-//     (the "Posted … ago" date on the page is a listing date, not an
-//     intake date) — so a new animal shows "Intake date not listed" in
-//     the app, and its firstSeen date is recorded separately.
-//  4. Pets no longer listed are dropped from the file (the app itself
-//     keeps a saved dropped animal in Saved, flagged gone — that is the
-//     app's job, not this file's).
-//  5. Writes backend/apple-valley.json atomically (temp file + rename).
-//     A failed pull NEVER overwrites the last good file: any fetch failure,
-//     an empty first page, or a suspiciously small total (< 50 animals)
-//     exits non-zero and leaves the old file untouched.
+// What it does, in order:
+//  1. Pulls the LA County DACC public animal list (same public endpoints the
+//     county's own search site calls: dacc-search page -> signature/timestamp
+//     -> wp-json/wppro-acc/v1/get/animals, route=Animals, paginated).
+//  2. For every LA County animal ID it has never seen, it fetches the
+//     AnimalByID detail record (same endpoint, route=AnimalByID) to get the
+//     intake date, and for dogs the behaviour assessment: recommendation2
+//     (Dog Social Skills) and recommendation4 (Energy Level). Values are
+//     shown verbatim, title-cased, exactly as the shelter publishes them.
+//     Nothing is guessed and no "Unknown" row is ever invented.
+//  3. Intake dates and assessments are CACHED by animal ID (backend/cache.json).
+//     An intake date never changes, so a known animal is never re-fetched for
+//     it. Assessments are re-checked only when a dog has not been checked in
+//     14 days, at most 40 dogs per run, so the daily run stays fast and the
+//     county does not rate-limit us (403s are retried with a fresh signature
+//     and backoff, 1.1s between detail calls).
+//  4. Merges Apple Valley animals from backend/apple-valley.json.
+//     That file is refreshed daily by backend/pull-apple-valley.mjs from
+//     Apple Valley Animal Services' PUBLIC Adopt-a-Pet listings (shelter
+//     82156) — no shelter feed, no API key, the shelter never sends us
+//     anything. Intake dates in that file are preserved from the Nov 11,
+//     2026 pull where known; new animals carry no intake date.
+//  5. Writes the feed JSON. If validation fails the previous good feed is
+//     left untouched and the run exits non-zero.
 //
-// The daily GitHub workflow runs this BEFORE backend/pull.mjs, which merges
-// apple-valley.json into animals.json and recomputes waiting days from the
-// stored intake dates. Source of truth for the merge is this file's asOf
-// date and note, carried into the feed as appleValleyAsOf / appleValleyNote.
+// The feed uses the EXACT animal record format of the Build 4 static app,
+// so the v1.1 app needs no other data changes:
+//   i=id, n=name, t=dog|cat|other, b=breed, s=sex, al=age label, ag=age group,
+//   sg=size group, sl=size label, c=color, sh=shelter label, st=status label,
+//   sk=status key, in=intake YYYY-MM-DD or null, d=days waiting or null,
+//   wl=waiting label, k=kennel, p=photo url or null,
+//   u=official listing url, sn=shelter number or null, bk=sort boost,
+//   en=Energy Level (dogs only, when published), so=Dog Social Skills (dogs only, when published)
 
 import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Accept both --out=animals.json and --out animals.json
 const _argv = process.argv.slice(2);
 const args = {};
 for (let i = 0; i < _argv.length; i++) {
   const a = _argv[i];
   if (!a.startsWith("--")) continue;
   const eq = a.indexOf("=");
-  if (eq !== -1) args[a.slice(2, eq)] = a.slice(eq + 1);
-  else if (i + 1 < _argv.length && !_argv[i + 1].startsWith("--")) args[a.slice(2)] = _argv[++i];
-  else args[a.slice(2)] = true;
+  if (eq !== -1) {
+    args[a.slice(2, eq)] = a.slice(eq + 1);
+  } else if (i + 1 < _argv.length && !_argv[i + 1].startsWith("--")) {
+    args[a.slice(2)] = _argv[++i];
+  } else {
+    args[a.slice(2)] = true;
+  }
 }
-const OUT = path.resolve(ROOT, args.out || "backend/apple-valley.json");
-const MAX_PAGES = Number(args["max-pages"] || 15);
-const PAGE_SLEEP_MS = 1000;
-const DETAIL_SLEEP_MS = 700;
-const MIN_ANIMALS = 50; // refuse to overwrite the last good file with a truncated parse
-const SHELTER_URL = "https://www.adoptapet.com/shelter/82156-apple-valley-animal-services-apple-valley-california";
-const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const OUT = path.resolve(ROOT, args.out || "data/animals.json");
+const CACHE_PATH = path.resolve(ROOT, args.cache || "backend/cache.json");
+const AV_PATH = path.resolve(ROOT, args["apple-valley"] || "backend/apple-valley.json");
+const TODAY = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
+const TODAY_ISO = TODAY.toISOString().slice(0, 10); // UTC date of the LA-local day is close enough for a feed label; days-waiting uses LA midnight below
+const LA_MIDNIGHT = new Date(`${TODAY.getFullYear()}-${String(TODAY.getMonth() + 1).padStart(2, "0")}-${String(TODAY.getDate()).padStart(2, "0")}T12:00:00`);
+const UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...m) => console.log(new Date().toISOString(), ...m);
-const TODAY = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
-const TODAY_ISO = `${TODAY.getFullYear()}-${String(TODAY.getMonth() + 1).padStart(2, "0")}-${String(TODAY.getDate()).padStart(2, "0")}`;
-const LA_MIDNIGHT = new Date(`${TODAY_ISO}T12:00:00`);
 
+function titleCase(v) {
+  if (!v) return null;
+  return String(v)
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
 function daysBetween(iso) {
   if (!iso) return null;
   const d = new Date(iso + "T12:00:00");
   if (isNaN(d.getTime())) return null;
   return Math.max(0, Math.round((LA_MIDNIGHT - d) / 86400000));
 }
-function stripTags(s) {
-  return s.replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, " ").trim();
-}
-async function fetchText(url, attempts = 3) {
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      const r = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9" } });
-      if (r.ok) return await r.text();
-      log(`fetch ${url} attempt ${i}: HTTP ${r.status}`);
-    } catch (e) {
-      log(`fetch ${url} attempt ${i} threw: ${e.message}`);
-    }
-    await sleep(2000 * i);
-  }
-  throw new Error(`could not fetch ${url} after ${attempts} attempts`);
+function ageLabel(months) {
+  if (months == null) return "Age not listed";
+  if (months < 12) return months + " mo old";
+  const y = Math.floor(months / 12), m = months % 12;
+  return m ? `${y} yr ${m} mo old` : `${y} yr old`;
 }
 
-// One shelter-list page -> [{ apId, url, name, breed, sex, ageGroup }]
-function parseShelterPage(html) {
-  const out = [];
-  const blocks = html.split("pet-card--component");
-  for (const b of blocks.slice(1)) {
-    const href = (b.match(/data-testid="pet-card-link"[^>]*href="(https:\/\/www\.adoptapet\.com\/pet\/(\d+)-[^"]+)"/) || [])[1];
-    const apId = (b.match(/data-testid="pet-card-link"[^>]*href="https:\/\/www\.adoptapet\.com\/pet\/(\d+)-/) || [])[1];
-    if (!href || !apId) continue;
-    const name = (b.match(/name">([^<]+)<\/p>/) || [])[1];
-    const breed = (b.match(/breed">([^<]+)<\/p>/) || [])[1];
-    // "<p class=\"truncate\">Female<span ...>, adult</span></p>"
-    const sexAge = b.match(/<p class="truncate">\s*(Male|Female)\s*<span[^>]*>,\s*(adult|kitten|puppy|senior)/i);
-    out.push({
-      apId,
-      url: href.replace(/\\$/, ""),
-      name: name ? stripTags(name) : null,
-      breed: breed ? stripTags(breed) : null,
-      sex: sexAge ? sexAge[1] : null,
-      ageGroup: sexAge ? sexAge[2].toLowerCase() : null,
-    });
-  }
-  return out;
-}
+const SHELTER_NAMES = { Baldwin: "Baldwin Park", Carson: "Carson / Gardena", Castaic: "Castaic (Santa Clarita Valley)" };
 
-// One pet detail page -> { species, photo, color, size, weightLbs, petId }
-// Only what the shelter publishes on that page. No story-text parsing:
-// the "~2 yrs old / 49 pounds" notes in the story are free text and are
-// NOT used for age or weight.
-function parseDetailPage(html) {
-  const species = (html.match(/\\"species\\":\\"(dog|cat|other)\\"/) || [])[1] || null;
-  const photo = (html.match(/<meta property="og:image" content="([^"]+)"/) || [])[1] || null;
-  const text = stripTags(html);
-  const info = (text.match(/My basic info (.*?) My story/) || [])[1] || "";
-  const field = (label) => {
-    // "Breed X Age Y Sex Z Color C Size S Weight W Pet ID N" (cats have
-    // "Hair Length" instead of Size/Weight; some fields are "Not listed").
-    // "My details" / "My health" can follow Pet ID on some pages, so they
-    // are terminators too — otherwise Pet ID swallows the rest of the block.
-    const labels = ["Breed", "Age", "Sex", "Color", "Size", "Weight", "Hair Length", "Pet ID", "My details", "My health"];
-    const re = new RegExp(label + "\\s+(.*?)(?=\\s+(?:" + labels.join("|") + ")\\s+|$)");
-    const m = info.match(re);
-    return m ? m[1].trim() : null;
-  };
-  const sizeRaw = field("Size");
-  const weightRaw = field("Weight");
-  const weightLbs = weightRaw && /^\d+/.test(weightRaw) ? Number(weightRaw.match(/^(\d+)/)[1]) : null;
-  const petId = field("Pet ID");
-  // The organisation actually listing the pet. Adopt-a-Pet's shelter page
-  // also surfaces pets from other Apple Valley rescues (e.g. Beagles and
-  // Buddies) — only "Apple Valley Animal Services" belongs in this file.
-  const org = (html.match(/\\"awoName\\":\\"([^"\\]+)/) || [])[1] || null;
+function mapListRow(x) {
+  if (!x || !x.animalId) return null;
+  const months = x.yearsOld == null && x.monthsOld == null ? null : (x.yearsOld || 0) * 12 + (x.monthsOld || 0);
+  const ag = months == null ? "unknown" : months < 6 ? "baby" : months < 24 ? "young" : months < 84 ? "adult" : "senior";
+  const raw = (x.animalSize || "").toUpperCase();
+  let sg = raw === "TOY" || raw === "SMALL" ? "small" : raw === "MED" ? "medium" : raw === "LARGE" || raw === "EXLG" ? "big" : "unknown";
+  if (sg === "unknown" && x.weight != null) sg = x.weight <= 25 ? "small" : x.weight <= 50 ? "medium" : "big";
+  const sgLabel = sg === "unknown" ? null : sg.charAt(0).toUpperCase() + sg.slice(1) + (x.weight != null ? " · " + Math.round(x.weight) + " lbs" : "");
+  const s = (x.kennelStat || "").toUpperCase();
+  let st = null, sk = "other";
+  if (x.rescueOnly || s.indexOf("RESC") !== -1) { st = "Rescue only"; sk = "rescue"; }
+  else if (s === "RTGH") { st = "Ready to go home"; sk = "rtgh"; }
+  else if (s.indexOf("AV PEND SN") !== -1) { st = "Available · pending spay/neuter"; sk = "avail"; }
+  else if (s.indexOf("AV BET") !== -1) { st = "Available · pending assessment"; sk = "avail"; }
+  else if (s.indexOf("HOLD") !== -1) { st = "On hold · ask the shelter"; sk = "hold"; }
+  else if (s.indexOf("STRAY") !== -1) { st = "Stray wait"; sk = "other"; }
+  else if (s.indexOf("PEND") !== -1) { st = "Adoption pending"; sk = "pend"; }
+  else if (x.kennelStat) { st = x.kennelStat; }
+  const img = "https://daccanimalimagesprod.blob.core.windows.net/images/" + x.animalId + ((x.imageCount || 1) > 1 ? "-" + x.imageCount : "") + ".jpg";
   return {
-    org,
-    species,
-    photo: photo && photo.includes("pet-uploads.adoptapet.com") ? photo.split("&")[0] : photo || null,
-    breed: field("Breed"),
-    ageWord: field("Age"),
-    sex: field("Sex"),
-    color: field("Color") && field("Color") !== "Not listed" ? field("Color") : null,
-    sizeRaw,
-    weightLbs,
-    petId: petId && /^\d+$/.test(petId) ? petId : null,
+    i: x.animalId, n: x.animalName || x.animalId,
+    t: (x.animalType || "OTHER").toUpperCase() === "DOG" ? "dog" : (x.animalType || "").toUpperCase() === "CAT" ? "cat" : "other",
+    b: x.breed || null, s: x.sex || null, al: ageLabel(months), ag, sg, sl: sgLabel,
+    c: x.primaryColor || null, sh: SHELTER_NAMES[x.location] || x.location || "LA County",
+    st, sk, in: null, d: null, wl: "Intake date not listed",
+    k: null, p: img, u: "https://animalcare.lacounty.gov/dacc-details/?animalId=" + x.animalId, sn: null, bk: 0,
   };
 }
 
-function ageGroupToRecord(ageWord) {
-  const w = (ageWord || "").toLowerCase();
-  if (w === "kitten" || w === "puppy") return { ag: "baby", al: ageWord };
-  if (w === "adult") return { ag: "adult", al: "Adult" };
-  if (w === "senior") return { ag: "senior", al: "Senior" };
-  return { ag: "unknown", al: "Age not listed" };
+async function fetchSignature() {
+  // The county site is flaky from a server (intermittent 403s and dropped
+  // connections). Retry both HTTP failures and network throws.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const r = await fetch("https://animalcare.lacounty.gov/dacc-search/?PageNumber=1", {
+        headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9" },
+      });
+      if (r.ok) {
+        const html = await r.text();
+        const sig = (html.match(/signature:\s*'([a-f0-9]+)'/) || [])[1];
+        const ts = (html.match(/timestamp:\s*'([0-9]+)'/) || [])[1];
+        if (sig && ts) return { sig, ts };
+      }
+      log(`signature fetch attempt ${attempt} failed (status ${r.status}), retrying…`);
+    } catch (e) {
+      log(`signature fetch attempt ${attempt} threw (${e.message}), retrying…`);
+    }
+    await sleep(2000 * attempt);
+  }
+  throw new Error("could not get a DACC search signature after 5 attempts");
 }
-function sizeToRecord(sizeRaw, weightLbs) {
-  const s = (sizeRaw || "").toLowerCase();
-  let sg = "unknown";
-  if (/^small/.test(s)) sg = "small";
-  else if (/^med/.test(s)) sg = "medium";
-  else if (/large|x-large/.test(s)) sg = "big";
-  const word = sg === "unknown" ? null : sg.charAt(0).toUpperCase() + sg.slice(1);
-  return { sg, sl: word ? word + (weightLbs != null ? ` · ${weightLbs} lbs` : "") : null };
+
+let auth = null;
+async function daccFetch(url) {
+  if (!auth) auth = await fetchSignature();
+  const headers = {
+    "X-AccSearch-Signature": auth.sig, "X-AccSearch-Timestamp": auth.ts,
+    "User-Agent": UA, Accept: "application/json",
+    Referer: "https://animalcare.lacounty.gov/dacc-search/?PageNumber=1",
+  };
+  let r = await fetch(url, { headers });
+  if (r.status === 403) {
+    // Signature expired / rate-limited: get a fresh one and retry once.
+    auth = await fetchSignature();
+    headers["X-AccSearch-Signature"] = auth.sig;
+    headers["X-AccSearch-Timestamp"] = auth.ts;
+    await sleep(1500);
+    r = await fetch(url, { headers });
+  }
+  return r;
+}
+
+async function fetchDetail(id) {
+  // Returns { intake, en, so } or null on failure. Retries 403s with a fresh signature.
+  const api = "https://animalcare.lacounty.gov/wp-json/wppro-acc/v1/get/animals";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await daccFetch(`${api}?route=AnimalByID&animalId=${encodeURIComponent(id)}`);
+      if (!r.ok) throw new Error(`detail HTTP ${r.status}`);
+      const j = await r.json();
+      const row = (j.animals || [])[0];
+      if (!row) return { intake: null, en: null, so: null, k: null };
+      return {
+        intake: row.intakeDate ? String(row.intakeDate).slice(0, 10) : null,
+        k: row.kennelNo || null,
+        // Dogs only: recommendation4 = Energy Level, recommendation2 = Dog Social Skills.
+        // Never relabel, never guess; null when the shelter did not publish one.
+        en: titleCase(row.recommendation4),
+        so: titleCase(row.recommendation2),
+      };
+    } catch (e) {
+      log(`detail ${id} attempt ${attempt} failed: ${e.message}`);
+      await sleep(1500 * attempt);
+    }
+  }
+  return null;
 }
 
 async function main() {
   const started = Date.now();
-  const oldDoc = existsSync(OUT) ? JSON.parse(readFileSync(OUT, "utf8")) : { animals: [] };
-  const oldById = new Map((oldDoc.animals || []).map((a) => [a.i, a]));
+  const cache = existsSync(CACHE_PATH) ? JSON.parse(readFileSync(CACHE_PATH, "utf8")) : { animals: {} };
+  cache.animals = cache.animals || {};
+  // Previous feed for new/dropped comparison: the last written feed, or on
+  // the very first run the Nov 11 Build 4 snapshot (backend/seed-static.json).
+  const prevFeed = existsSync(OUT)
+    ? JSON.parse(readFileSync(OUT, "utf8"))
+    : existsSync(path.resolve(ROOT, "backend/seed-static.json"))
+      ? JSON.parse(readFileSync(path.resolve(ROOT, "backend/seed-static.json"), "utf8"))
+      : null;
+  const prevIds = new Set((prevFeed?.animals || []).map((a) => a.i));
 
-  // 1. Shelter list pages, newest first, 12 per page.
-  const seen = new Map(); // apId -> card
-  let page = 1, lastPageCount = 12; // start at 12 so the first page is fetched; the loop stops after a short (< 12) page
-  while (page <= MAX_PAGES && lastPageCount === 12) {
-    const html = await fetchText(`${SHELTER_URL}?page=${page}`);
-    const cards = parseShelterPage(html);
-    if (page === 1 && cards.length === 0) throw new Error("shelter page 1 returned no pet cards — refusing to overwrite the last good file");
-    for (const c of cards) if (!seen.has(c.apId)) seen.set(c.apId, c);
-    log(`shelter page ${page}: ${cards.length} cards, ${seen.size} unique so far`);
-    lastPageCount = cards.length;
+  // 1. List pull (paginated).
+  const api = "https://animalcare.lacounty.gov/wp-json/wppro-acc/v1/get/animals";
+  let all = [], total = Infinity, page = 1, retries403 = 0;
+  while (all.length < total && page <= 30) {
+    const r = await daccFetch(`${api}?route=Animals&PageNumber=${page}&PageSize=100&SortType=1`);
+    if (r.status === 403) retries403++;
+    if (!r.ok) throw new Error(`list page ${page} HTTP ${r.status}`);
+    const j = await r.json();
+    total = j.totalRecords || 0;
+    (j.animals || []).forEach((x) => { const a = mapListRow(x); if (a) all.push(a); });
+    log(`list page ${page}: ${all.length}/${total}`);
     page++;
-    if (lastPageCount === 12) await sleep(PAGE_SLEEP_MS);
+    await sleep(400);
   }
-  const cards = [...seen.values()];
-  log(`list done: ${cards.length} Apple Valley pets on the public shelter page`);
+  log(`list done: ${all.length} LA County animals (county says ${total})`);
 
-  // 2. Keep old records as-is; fetch detail pages only for new pets.
-  const fresh = [];
-  let kept = 0, added = 0, detailFail = 0, skippedOther = 0;
-  for (const c of cards) {
-    const id = "AP" + c.apId;
-    const old = oldById.get(id);
-    if (old) {
-      kept++;
-      fresh.push(old);
-      continue;
+  // 2. Detail enrichment: new animals first, then a bounded re-check of stale dog assessments.
+  // New animals, animals missing an intake date, and animals missing a
+  // kennel number (the first v1.1 run did not store kennels — one-time backfill).
+  const needDetail = all.filter((a) => !cache.animals[a.i] || !cache.animals[a.i].in || !cache.animals[a.i].k);
+  const staleDogs = all
+    .filter((a) => a.t === "dog" && cache.animals[a.i]?.in && cache.animals[a.i]?.assessedAt)
+    .filter((a) => (Date.now() - new Date(cache.animals[a.i].assessedAt).getTime()) / 86400000 > 14)
+    .sort((a, b) => new Date(cache.animals[a.i].assessedAt) - new Date(cache.animals[b.i].assessedAt))
+    .slice(0, 40);
+  const queue = [...needDetail, ...staleDogs.filter((a) => !needDetail.includes(a))];
+  log(`detail queue: ${needDetail.length} new/missing-intake + ${queue.length - needDetail.length} stale dog assessments`);
+  let detailOk = 0, detailFail = 0;
+  for (const a of queue) {
+    const d = await fetchDetail(a.i);
+    await sleep(1100);
+    if (!d) { detailFail++; continue; }
+    detailOk++;
+    const prev = cache.animals[a.i] || {};
+    cache.animals[a.i] = {
+      in: d.intake || prev.in || null,
+      k: d.k || prev.k || null,
+      bk: prev.bk ?? 0,
+      en: a.t === "dog" ? (d.en ?? prev.en ?? null) : null,
+      so: a.t === "dog" ? (d.so ?? prev.so ?? null) : null,
+      assessedAt: a.t === "dog" ? new Date().toISOString() : prev.assessedAt || null,
+      seenAt: new Date().toISOString(),
+    };
+  }
+  log(`details done: ${detailOk} ok, ${detailFail} failed (those keep their cached values, or stay without an intake date)`);
+
+  // 3. Apply cache to the list, compute waiting time, sort longest-waiting first.
+  const animals = all.map((a) => {
+    const c = cache.animals[a.i] || {};
+    const intake = c.in || null;
+    const d = daysBetween(intake);
+    const out = { ...a, in: intake, d, wl: d != null ? `${d} days waiting` : "Intake date not listed", k: c.k || null, bk: c.bk ?? 0 };
+    if (a.t === "dog") {
+      if (c.en) out.en = c.en;
+      if (c.so) out.so = c.so;
     }
-    let d = null;
-    try {
-      d = parseDetailPage(await fetchText(c.url));
-    } catch (e) {
-      detailFail++;
-      log(`detail ${id} failed: ${e.message} — skipping this pet this run (it will be picked up next run, never invented)`);
-      await sleep(DETAIL_SLEEP_MS);
-      continue;
-    }
-    await sleep(DETAIL_SLEEP_MS);
-    if (d.org && d.org !== "Apple Valley Animal Services") {
-      skippedOther++;
-      log(`skip ${id} (${c.name || "?"}) — listed by ${d.org}, not Apple Valley Animal Services`);
-      continue;
-    }
-    const { ag, al } = ageGroupToRecord(d.ageWord || (c.ageGroup ? c.ageGroup.charAt(0).toUpperCase() + c.ageGroup.slice(1) : null));
-    const { sg, sl } = sizeToRecord(d.sizeRaw, d.weightLbs);
-    const t = d.species === "cat" ? "cat" : d.species === "dog" ? "dog" : "other";
-    fresh.push({
-      i: id,
-      n: c.name || d.breed || id,
-      t,
-      b: d.breed || c.breed || null,
-      s: d.sex || c.sex || null,
-      al, ag, sg, sl,
-      c: d.color,
-      sh: "Apple Valley",
-      st: null, sk: "other",
-      in: null, d: null, wl: "Intake date not listed",
-      k: null,
-      p: d.photo || null,
-      u: c.url,
-      sn: d.petId || null,
-      bk: 0,
-      firstSeen: TODAY_ISO,
+    return out;
+  });
+  animals.sort((x, y) => {
+    const xi = x.in ? Date.parse(x.in) : NaN, yi = y.in ? Date.parse(y.in) : NaN;
+    if (!isNaN(xi) && !isNaN(yi) && xi !== yi) return xi - yi;
+    if (!isNaN(xi) && isNaN(yi)) return -1;
+    if (!isNaN(xi) && !isNaN(yi)) return 1;
+    if ((y.bk || 0) !== (x.bk || 0)) return (y.bk || 0) - (x.bk || 0);
+    return x.i < y.i ? -1 : 1;
+  });
+
+  // 4. Apple Valley: refreshed daily by backend/pull-apple-valley.mjs
+  //    from the shelter's public Adopt-a-Pet listings (see
+  //    APPLE-VALLEY-PULL.md). Recompute waiting days from stored intake dates.
+  let av = [], avAsOf = null, avNote = "";
+  if (existsSync(AV_PATH)) {
+    const avDoc = JSON.parse(readFileSync(AV_PATH, "utf8"));
+    av = avDoc.animals || [];
+    avAsOf = avDoc.asOf || null;
+    avNote = avDoc.note || "";
+    // Recompute Apple Valley waiting days from their stored intake dates.
+    av = av.map((a) => {
+      const d = daysBetween(a.in);
+      return { ...a, d, wl: d != null ? `${d} days waiting` : "Intake date not listed" };
     });
-    added++;
   }
-
-  // 3. Validate before touching the last good file.
-  if (fresh.length < MIN_ANIMALS) throw new Error(`only ${fresh.length} animals parsed (minimum ${MIN_ANIMALS}) — refusing to overwrite the last good file`);
-  const ids = new Set();
-  for (const a of fresh) {
-    if (!a.i || !a.n || !a.t || !a.sh || !a.u) throw new Error(`invalid record: ${JSON.stringify(a).slice(0, 200)}`);
-    if (ids.has(a.i)) throw new Error(`duplicate id ${a.i}`);
-    ids.add(a.i);
-    // New records must never carry an intake date (kept records keep the
-    // one from the Nov 11 pull). Construction guarantees this; check it.
-    if (a.firstSeen === TODAY_ISO && a.in) throw new Error(`new record ${a.i} has an intake date — intake dates are never set for new animals`);
-  }
-  const dropped = [...oldById.keys()].filter((id) => !ids.has(id));
-
-  // Sort longest-waiting first (intake ascending), no-intake last, then id —
-  // the same order pull.mjs uses when it merges this file into the feed.
-  fresh.sort((x, y) => {
+  const allAnimals = [...animals, ...av].sort((x, y) => {
     const xi = x.in ? Date.parse(x.in) : NaN, yi = y.in ? Date.parse(y.in) : NaN;
     if (!isNaN(xi) && !isNaN(yi) && xi !== yi) return xi - yi;
     if (!isNaN(xi) && isNaN(yi)) return -1;
     if (isNaN(xi) && !isNaN(yi)) return 1;
     return x.i < y.i ? -1 : 1;
   });
-  // Recompute waiting labels from stored intake dates (same math as pull.mjs).
-  for (const a of fresh) {
-    const d = daysBetween(a.in);
-    a.d = d;
-    a.wl = d != null ? `${d} days waiting` : "Intake date not listed";
-  }
 
-  const doc = {
-    asOf: TODAY_ISO,
-    note: "Public Adopt-a-Pet listings for Apple Valley Animal Services (shelter 82156), refreshed daily. No shelter feed and no API key: the shelter never sends us anything. Each animal links back to its official Adopt-a-Pet listing. Intake dates are kept from the Nov 11, 2026 pull where known; new animals show no intake date rather than a guessed one.",
-    animals: fresh,
+  const newIds = allAnimals.filter((a) => !prevIds.has(a.i)).map((a) => a.i);
+  const droppedIds = [...prevIds].filter((id) => !allAnimals.some((a) => a.i === id));
+  const feed = {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    generatedDate: TODAY.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+    source: "LA County DACC public API (live) + Apple Valley Adopt-a-Pet public listings (daily)",
+    counts: {
+      total: allAnimals.length,
+      laCounty: animals.length,
+      appleValley: av.length,
+      withIntakeDate: allAnimals.filter((a) => a.in).length,
+      withEnergy: allAnimals.filter((a) => a.en).length,
+      withDogSocial: allAnimals.filter((a) => a.so).length,
+      newSinceLastFeed: newIds.length,
+      droppedSinceLastFeed: droppedIds.length,
+    },
+    appleValleyAsOf: avAsOf,
+    appleValleyNote: avNote,
+    newIds, droppedIds,
+    animals: allAnimals,
   };
-  writeFileSync(OUT + ".new", JSON.stringify(doc, null, 1));
+
+  // 5. Validate before overwriting the previous good feed.
+  const ids = new Set();
+  for (const a of allAnimals) {
+    if (!a.i || !a.n || !a.t || !a.sh || !a.u) throw new Error(`invalid animal record: ${JSON.stringify(a).slice(0, 200)}`);
+    if (ids.has(a.i)) throw new Error(`duplicate animal id ${a.i}`);
+    ids.add(a.i);
+    if ((a.en || a.so) && a.t !== "dog") throw new Error(`assessment on non-dog ${a.i}`);
+    if (a.en === "Unknown" || a.so === "Unknown") throw new Error(`Unknown assessment on ${a.i}`);
+  }
+  if (allAnimals.length < 500) throw new Error(`feed too small (${allAnimals.length}), refusing to overwrite the last good feed`);
+  if (animals.length < 500) throw new Error(`LA County list too small (${animals.length})`);
+
+  writeFileSync(OUT + ".new", JSON.stringify(feed, null, 1));
   renameSync(OUT + ".new", OUT);
-  log(`APPLE VALLEY WRITTEN ${OUT}: ${fresh.length} animals (${kept} kept, ${added} new, ${dropped.length} dropped${skippedOther ? `, ${skippedOther} skipped (other rescue)` : ""}${detailFail ? `, ${detailFail} detail fetch(es) failed and skipped` : ""}). Dropped: ${dropped.join(", ") || "none"}. New: ${fresh.filter((a) => a.firstSeen === TODAY_ISO).map((a) => a.i).join(", ") || "none"}. ${((Date.now() - started) / 1000).toFixed(0)}s.`);
+  writeFileSync(CACHE_PATH, JSON.stringify(cache, null, 1));
+  log(`FEED WRITTEN ${OUT}: ${feed.counts.total} animals (${feed.counts.laCounty} LA County + ${feed.counts.appleValley} Apple Valley), ${feed.counts.newSinceLastFeed} new, ${feed.counts.droppedSinceLastFeed} dropped, ${feed.counts.withIntakeDate} with intake dates, ${feed.counts.withEnergy} with Energy, ${feed.counts.withDogSocial} with Dog Social. ${((Date.now() - started) / 1000).toFixed(0)}s, ${retries403} list 403s.`);
 }
 
-main().catch((e) => { console.error("APPLE VALLEY PULL FAILED:", e.message); process.exit(1); });
+main().catch((e) => { console.error("PULL FAILED:", e.message); process.exit(1); });
